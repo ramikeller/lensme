@@ -1,14 +1,13 @@
 use anyhow::Result;
 use burn::backend::Wgpu;
+use burn::backend::wgpu::WgpuDevice;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod index;
 mod model;
 mod preprocess;
 
-// We pin our backend to Wgpu once here. On your M4 Mac this automatically
-// targets Metal. Everywhere else in the codebase we just say `MyBackend`
-// so switching backends later requires changing only this one line.
 type MyBackend = Wgpu;
 
 /// lensme – visual image search engine
@@ -26,7 +25,7 @@ enum Command {
         /// Path to the folder of images
         folder: PathBuf,
 
-        /// Where to write the index file (default: lensme.index)
+        /// Where to write the index file
         #[arg(long, default_value = "lensme.index")]
         output: PathBuf,
     },
@@ -59,39 +58,80 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Index { folder, output } => {
-            println!("Indexing images in: {}", folder.display());
-            println!("Writing index to:   {}", output.display());
-
-            let device = burn::backend::wgpu::WgpuDevice::default();
-
-            println!("Loading pretrained ResNet-18 encoder...");
+            println!("Loading pretrained encoder...");
+            let device = WgpuDevice::default();
             let net = model::load_encoder::<MyBackend>(&device);
 
-            // Test on the first image we find.
-            for entry in walkdir::WalkDir::new(&folder)
+            let mut idx = index::Index::new();
+            let mut done = 0usize;
+            let mut skipped = 0usize;
+
+            // Walk the folder recursively and collect every image path first,
+            // so we can show a "N / total" counter while embedding.
+            let paths: Vec<_> = walkdir::WalkDir::new(&folder)
                 .into_iter()
                 .filter_map(|e| e.ok())
                 .filter(|e| is_image(e.path()))
-                .take(1)
-            {
-                println!("Loading: {}", entry.path().display());
-                let img_tensor = preprocess::load_image::<MyBackend>(entry.path(), &device)?;
-                println!("Input  shape: {:?}", img_tensor.shape());
+                .map(|e| e.path().to_path_buf())
+                .collect();
 
-                let embedding = net.forward(img_tensor);
-                println!("Output shape: {:?}", embedding.shape());
+            let total = paths.len();
+            println!("Found {total} images in {}.", folder.display());
 
-                // Print first 8 values — with random weights these would be
-                // near zero; with pretrained weights they are meaningful floats.
-                let vals: Vec<f32> = embedding.clone().into_data().to_vec().unwrap();
-                println!("First 8 embedding values: {:.4?}", &vals[..8]);
+            for path in &paths {
+                // Load and preprocess; skip the file on error rather than aborting.
+                let tensor = match preprocess::load_image::<MyBackend>(path, &device) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("  skip {}: {e}", path.display());
+                        skipped += 1;
+                        continue;
+                    }
+                };
+
+                // Forward pass through ResNet-18 → [1, 512] tensor
+                let embedding = net.forward(tensor);
+
+                // Pull the 512 floats off the GPU and into a plain Vec<f32>
+                let values: Vec<f32> = embedding.into_data().to_vec().unwrap();
+
+                idx.add(path.to_string_lossy().into_owned(), values);
+                done += 1;
+
+                // Progress every 10 images so the user knows it's working
+                if done % 10 == 0 || done == total {
+                    println!("  [{done}/{total}] indexed");
+                }
+            }
+
+            idx.save(&output)?;
+            println!("Saved index → {} ({done} images)", output.display());
+            if skipped > 0 {
+                println!("  ({skipped} files skipped due to errors)");
             }
         }
+
         Command::Query { image, k, index } => {
-            println!("Query image: {}", image.display());
-            println!("Index file:  {}", index.display());
-            println!("Top-K:       {k}");
-            // TODO: Step 3 – embed query and search index
+            // Load the index first — fail early with a clear message if missing.
+            let idx = index::Index::load(&index)?;
+            if idx.entries.is_empty() {
+                anyhow::bail!("Index is empty — run `lensme index <folder>` first.");
+            }
+            println!("Loaded index: {} images", idx.entries.len());
+
+            // Embed the query image through the same pipeline used at index time.
+            let device = WgpuDevice::default();
+            let net = model::load_encoder::<MyBackend>(&device);
+            let tensor = preprocess::load_image::<MyBackend>(&image, &device)?;
+            let query_vec: Vec<f32> = net.forward(tensor).into_data().to_vec().unwrap();
+
+            // Rank every index entry by cosine similarity to the query.
+            let results = idx.search(&query_vec, k);
+
+            println!("\nTop-{k} matches for '{}':\n", image.display());
+            for (rank, (path, score)) in results.iter().enumerate() {
+                println!("  {}. score={:.4}  {}", rank + 1, score, path);
+            }
         }
     }
 
