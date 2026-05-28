@@ -1,0 +1,10 @@
+/target
+
+# Synthetic test images (not real data worth committing)
+test_images/
+
+# burn-import generates this from the ONNX at build time; no need to track it
+*.bpk
+
+# Index files produced at runtime
+*.index

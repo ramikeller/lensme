@@ -1,0 +1,30 @@
+[package]
+name = "lensme"
+version = "0.1.0"
+edition = "2024"
+
+[build-dependencies]
+# Reads our ONNX file at `cargo build` time and generates a burn model + weight file
+burn-import = "0.21"
+
+[dependencies]
+# ML framework — wgpu backend uses Metal on Mac M4 automatically
+burn = { version = "0.21", features = ["wgpu"] }
+# Weight loading — burn-import's generated code imports this directly
+burn-store = "0.21"
+
+# Image loading and preprocessing (resize, pixel access)
+image = "0.25"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Serializing our index file to/from disk
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Walk a directory tree to find all image files
+walkdir = "2"
+
+# Ergonomic error handling for a CLI tool
+anyhow = "1"
